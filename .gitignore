@@ -5,6 +5,7 @@ venv/
 # Python cache
 __pycache__/
 *.py[cod]
+*.egg-info/
 
 # Environment variables and secrets
 .env
