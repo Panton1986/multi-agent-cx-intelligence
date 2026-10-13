@@ -27,6 +27,10 @@ data/generated/
 *.log
 logs/
 
+# Airflow runtime artifacts (keep dags/ source files tracked)
+/airflow/logs/
+/airflow/tmp/
+
 # IDE and OS
 .idea/
 .DS_Store

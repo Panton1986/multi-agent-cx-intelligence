@@ -1,0 +1,30 @@
+# Combine with docker-compose.yml and docker-compose.airflow.yml using -f options.
+# All services share the Compose project default network.
+services:
+  # Business data storage, independent of the Airflow metadata database.
+  cx-postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: cx_intelligence
+      POSTGRES_USER: cx_app
+      POSTGRES_PASSWORD: "${CX_POSTGRES_PASSWORD:?Set CX_POSTGRES_PASSWORD in .env}"
+    ports:
+      # Host connections use localhost:5433; containers use cx-postgres:5432.
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - cx_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'pg_isready -h 127.0.0.1 -p 5432 -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"'
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    # Cap database memory at 1 GB to leave room for Airflow and SeaweedFS.
+    mem_limit: 1g
+    restart: unless-stopped
+
+volumes:
+  # Dedicated business-data volume, separate from airflow-postgres-data.
+  cx_postgres_data:

@@ -1,0 +1,145 @@
+# Use together with docker-compose.yml, under the same Compose project name:
+# docker compose -f docker-compose.yml -f docker-compose.airflow.yml ...
+# Both files use the project default network; S3 is at http://seaweedfs-s3:8333.
+# Future DAGs must use schedule=None for manual triggering only.
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:3.3.2
+  user: "${AIRFLOW_UID:-50000}:0"
+  environment: &airflow-environment
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: utc
+    # LocalExecutor runs tasks in the scheduler container, with at most two task slots.
+    AIRFLOW__CORE__PARALLELISM: "2"
+    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: "2"
+    AIRFLOW__CORE__MAX_ACTIVE_RUNS_PER_DAG: "1"
+    AIRFLOW__API__WORKERS: "1"
+    AIRFLOW__DAG_PROCESSOR__PARSING_PROCESSES: "1"
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-api-server:8080/execution/
+    # All components share these secrets; no generated or hardcoded fallback secrets.
+    AIRFLOW__CORE__FERNET_KEY: "${AIRFLOW_FERNET_KEY:?Set AIRFLOW_FERNET_KEY}"
+    AIRFLOW__API__SECRET_KEY: "${AIRFLOW_API_SECRET_KEY:?Set AIRFLOW_API_SECRET_KEY}"
+    AIRFLOW__API_AUTH__JWT_SECRET: "${AIRFLOW_JWT_SECRET:?Set AIRFLOW_JWT_SECRET}"
+    POSTGRES_DB: "${AIRFLOW_POSTGRES_DB:?Set AIRFLOW_POSTGRES_DB}"
+    POSTGRES_USER: "${AIRFLOW_POSTGRES_USER:?Set AIRFLOW_POSTGRES_USER}"
+    POSTGRES_PASSWORD: "${AIRFLOW_POSTGRES_PASSWORD:?Set AIRFLOW_POSTGRES_PASSWORD}"
+    # Airflow captures this command's output privately as its database connection URI.
+    # URL.create safely encodes special characters in the environment-supplied password.
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN_CMD: >-
+      python -c "import os; import sys; from sqlalchemy.engine import URL;
+      sys.stdout.write(URL.create('postgresql+psycopg2', username=os.environ['POSTGRES_USER'],
+      password=os.environ['POSTGRES_PASSWORD'], host='airflow-postgres', port=5432,
+      database=os.environ['POSTGRES_DB']).render_as_string(hide_password=False))"
+    TMPDIR: /opt/airflow/tmp
+    PYTHONPATH: /opt/airflow/src
+  volumes:
+    # Keep source DAGs local; runtime containers do not need to modify them.
+    - ./dags:/opt/airflow/dags:ro
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/tmp:/opt/airflow/tmp
+    - ./data/generated:/opt/airflow/data/generated:ro
+    - ./src:/opt/airflow/src:ro
+  depends_on: &airflow-dependencies
+    airflow-postgres:
+      condition: service_healthy
+    airflow-init:
+      condition: service_completed_successfully
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  # Dedicated metadata database; no application tables or host database port.
+  airflow-postgres:
+    image: postgres:16-bookworm
+    environment:
+      POSTGRES_DB: "${AIRFLOW_POSTGRES_DB:?Set AIRFLOW_POSTGRES_DB}"
+      POSTGRES_USER: "${AIRFLOW_POSTGRES_USER:?Set AIRFLOW_POSTGRES_USER}"
+      POSTGRES_PASSWORD: "${AIRFLOW_POSTGRES_PASSWORD:?Set AIRFLOW_POSTGRES_PASSWORD}"
+    volumes:
+      - airflow-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  # One-shot database migration and administrator creation using the official entrypoint.
+  airflow-init:
+    <<: *airflow-common
+    user: "0:0"
+    entrypoint: /bin/bash
+    command:
+      - -euc
+      - |
+        mkdir -p /opt/airflow/logs /opt/airflow/tmp
+        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/logs /opt/airflow/tmp
+        exec /entrypoint airflow db check-migrations --migration-wait-timeout 60
+    environment:
+      <<: *airflow-environment
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: "${AIRFLOW_ADMIN_USERNAME:?Set AIRFLOW_ADMIN_USERNAME}"
+      _AIRFLOW_WWW_USER_PASSWORD: "${AIRFLOW_ADMIN_PASSWORD:?Set AIRFLOW_ADMIN_PASSWORD}"
+      _AIRFLOW_WWW_USER_EMAIL: "${AIRFLOW_ADMIN_EMAIL:?Set AIRFLOW_ADMIN_EMAIL}"
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # Airflow 3 serves both the Web UI and execution API through the API server.
+  airflow-api-server:
+    <<: *airflow-common
+    command: ["api-server", "--host", "0.0.0.0", "--port", "8080"]
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    environment:
+      <<: *airflow-environment
+      SEAWEEDFS_S3_ENDPOINT: "http://seaweedfs-s3:8333"
+      SEAWEEDFS_S3_ACCESS_KEY: "${SEAWEEDFS_S3_ACCESS_KEY:?Set SEAWEEDFS_S3_ACCESS_KEY}"
+      SEAWEEDFS_S3_SECRET_KEY: "${SEAWEEDFS_S3_SECRET_KEY:?Set SEAWEEDFS_S3_SECRET_KEY}"
+    depends_on:
+      <<: *airflow-dependencies
+      airflow-api-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+volumes:
+  # Persist only Airflow metadata here, independently of SeaweedFS/application storage.
+  airflow-postgres-data:
