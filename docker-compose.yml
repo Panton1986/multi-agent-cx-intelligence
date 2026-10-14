@@ -52,13 +52,15 @@ services:
       # Keep LevelDB2 metadata under the persistent /data mount.
       WEED_LEVELDB2_ENABLED: "true"
       WEED_LEVELDB2_DIR: /data/filerldb2
+    ports:
+      # Expose the Filer web UI only on Windows localhost.
+      - "127.0.0.1:8888:8888"
     volumes:
       - seaweedfs-filer-data:/data
     depends_on:
       - seaweedfs-master
       - seaweedfs-volume
     restart: unless-stopped
-    # Port 8888 stays internal to the Compose network; no host port mapping.
 
   # S3 Gateway provides an S3-compatible API backed by the Filer.
   seaweedfs-s3:
@@ -86,6 +88,17 @@ services:
     restart: unless-stopped
     # Object data and metadata persist through existing services; no named gateway volume needed.
 
+  # CPU-based vector storage on the existing Compose default network.
+  qdrant:
+    image: qdrant/qdrant:v1.19.2
+    ports:
+      # REST API and Web UI are accessible only from Windows localhost.
+      - "127.0.0.1:6333:6333"
+    volumes:
+      - qdrant-storage:/qdrant/storage
+    restart: unless-stopped
+    # gRPC port 6334 is not published to the host.
+
 volumes:
   # Keep Master metadata across container recreation.
   seaweedfs-master-data:
@@ -93,3 +106,5 @@ volumes:
   seaweedfs-volume-data:
   # Keep Filer metadata across container recreation.
   seaweedfs-filer-data:
+  # Persist Qdrant data across container recreation.
+  qdrant-storage:
